@@ -1,111 +1,70 @@
-<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>手机扫码测试</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;margin:0;padding:16px;max-width:860px}
-    .card{border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-top:12px}
-    .btn{padding:10px 12px;border:1px solid #cbd5e1;border-radius:8;background:#f8fafc;cursor:pointer}
-    .btn.pri{background:#2563eb;color:#fff;border-color:#1d4ed8}
-    .btn.dng{background:#ef4444;color:#fff;border-color:#dc2626}
-    #log{white-space:pre-wrap;font-size:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8;padding:10px;max-height:320px;overflow:auto}
-    #view{width:100%;min-height:260px;border-radius:12px;overflow:hidden}
-  </style>
-</head>
-<body>
-  <h1>手机扫码测试（纯静态）</h1>
-  <p style="opacity:.8">要求：HTTPS、系统 Safari/Chrome、非无痕，并允许浏览器相机权限。</p>
+async function openScanner() {
+  setOpen(true);
+  setFallback(false);
+  p('打开相机中…');
 
-  <div style="display:flex;gap:8;flex-wrap:wrap;margin-top:12px">
-    <button class="btn pri" id="open">📷 打开摄像头扫码</button>
-    <button class="btn dng" id="stop" disabled>⏹ 停止相机</button>
-    <input type="file" id="file" accept="image/*" capture="environment" style="margin-left:8px" />
-  </div>
+  try {
+    // 1) 预热权限（最宽松的请求，触发授权弹窗）
+    const pre = await navigator.mediaDevices.getUserMedia({ video: true });
+    // 立即停止预热流，避免占用
+    pre.getTracks().forEach(t => t.stop());
 
-  <div id="scanner" class="card">
-    <div id="view"></div>
-    <p style="font-size:12;opacity:.7;margin-top:8">
-      如果黑屏/打不开：设置→Safari/Chrome→相机→允许；确认使用 HTTPS；非无痕；不要用 App 内置浏览器。
-    </p>
-  </div>
+    // 2) 枚举设备，尽量选“后置摄像头”
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const videos = devs.filter(d => d.kind === 'videoinput');
 
-  <h3 style="margin-top:18px">日志</h3>
-  <pre id="log"></pre>
+    // 规则：优先找 label 包含 back / rear；否则取最后一个
+    let backCam = videos.find(d => /back|rear|environment/i.test(d.label));
+    if (!backCam && videos.length) backCam = videos[videos.length - 1];
+    const deviceId = backCam?.deviceId;
 
-  <!-- 按需从 CDN 加载扫码库 -->
-  <script>
-    let inst = null;
-
-    function log(s){ const el=document.getElementById('log'); el.textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.textContent; }
-
-    function loadLib(){
-      return new Promise((res, rej)=>{
-        if(window.Html5Qrcode) return res(window.Html5Qrcode);
-        const s=document.createElement('script');
-        s.src='https://unpkg.com/html5-qrcode@2.3.10/minified/html5-qrcode.min.js';
-        s.async=true;
-        s.onload=()=> window.Html5Qrcode ? res(window.Html5Qrcode) : rej(new Error('加载失败'));
-        s.onerror=()=> rej(new Error('无法加载 html5-qrcode'));
-        document.body.appendChild(s);
-      });
+    // 3) 检查基础环境
+    const isSecure = window.isSecureContext;
+    const canGUM = !!navigator.mediaDevices?.getUserMedia;
+    if (!isSecure || !canGUM) {
+      setFallback(true);
+      p('非 HTTPS 或浏览器不支持 getUserMedia，启用拍照识别。');
+      return;
     }
 
-    async function openCam(){
-      document.getElementById('open').disabled = true;
-      try{
-        if(!window.isSecureContext) { log('非 HTTPS 环境，改用拍照识别。'); return; }
-        if(!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){ log('浏览器不支持 getUserMedia，改用拍照识别。'); return; }
+    // 4) 动态加载库并启动 html5-qrcode（指定 deviceId）
+    const Html5Qrcode = await loadHtml5Qrcode();
+    if (!mountRef.current) return;
 
-        const Html5Qrcode = await loadLib();
-        const id='qr-' + Math.random().toString(36).slice(2);
-        const view=document.getElementById('view');
-        view.innerHTML = `<div id="${id}" style="width:100%"></div>`;
-        inst = new Html5Qrcode(id);
-        await inst.start(
-          { facingMode: { ideal: 'environment' } },
-          { fps: 5, qrbox: { width: 240, height: 240 } },
-          (txt)=>{ log('识别成功：'+txt); alert('识别成功：'+txt); stopCam(); },
-          ()=>{}
-        );
-        document.getElementById('stop').disabled = false;
-        log('相机已启动 ✅');
-      }catch(e){
-        log('相机启动失败：' + (e.name || e.message || e));
-        document.getElementById('open').disabled = false;
-      }
+    const id = 'qr-' + Math.random().toString(36).slice(2);
+    mountRef.current.innerHTML = `<div id="${id}" style="width:100%"></div>`;
+    const inst = new Html5Qrcode(id);
+    scannerRef.current = inst;
+
+    const cameraConfig = deviceId
+      ? { deviceId: { exact: deviceId } } // 精准使用后置
+      : { facingMode: { ideal: 'environment' } }; // 退路
+
+    await inst.start(
+      cameraConfig,
+      { fps: 5, qrbox: { width: 240, height: 240 } }, // iOS 稳一点
+      (txt: string) => {
+        p('识别成功：' + txt);
+        alert('识别成功：' + txt);
+        stopScanner();
+      },
+      () => {}
+    );
+
+    p('相机已启动 ✅');
+    document.getElementById('stop')?.removeAttribute('disabled');
+  } catch (e: any) {
+    // 常见错误名直说原因
+    const name = e?.name || '';
+    if (/NotAllowedError|Permission/i.test(name)) {
+      p('相机启动失败：未授予权限（到 设置→Safari/Chrome→相机→允许）');
+    } else if (/NotFoundError|Overconstrained/i.test(name)) {
+      p('相机启动失败：未找到可用摄像头或被占用（关闭占用相机的 App 重试）');
+    } else if (/NotSupportedError/i.test(name)) {
+      p('相机启动失败：环境不支持（HTTP/无痕/安全头拦截）');
+    } else {
+      p('相机启动失败：' + (e?.message || String(e)));
     }
-
-    async function stopCam(){
-      try{ await inst?.stop(); }catch{}
-      try{ await inst?.clear(); }catch{}
-      inst=null;
-      document.getElementById('stop').disabled = true;
-      document.getElementById('open').disabled = false;
-    }
-
-    async function scanFile(file){
-      try{
-        const Html5Qrcode = await loadLib();
-        const id='qr-file-' + Math.random().toString(36).slice(2);
-        const view=document.getElementById('view');
-        view.innerHTML = `<div id="${id}" style="display:none"></div>`;
-        const r=new Html5Qrcode(id);
-        const txt=await r.scanFile(file,true);
-        await r.clear();
-        log('图片识别成功：'+txt);
-        alert('图片识别成功：'+txt);
-        stopCam();
-      }catch(e){
-        log('图片识别失败：' + (e.message || e));
-        alert('无法识别该图片中的二维码，请重试/光线更亮些。');
-      }
-    }
-
-    document.getElementById('open').onclick = openCam;
-    document.getElementById('stop').onclick = stopCam;
-    document.getElementById('file').onchange = (e)=>{ const f=e.target.files?.[0]; if(f) scanFile(f); e.target.value=''; }
-  </script>
-</body>
-</html>
+    setFallback(true); // 自动切到拍照/相册识别
+  }
+}
